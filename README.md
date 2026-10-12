@@ -1,418 +1,327 @@
-# 全发首页 AI 小助手 Agent
+<div align="center">
 
-这是前端项目 `agent/` 目录下的 AI 小助手后端模块，基于 FastAPI、LangChain、Chroma、DashScope/OpenAI 兼容接口实现。
+# 全发 AI 助手
 
-当前能力：
+### 让平台知识可查询，让文档与图片可理解
 
-- 普通问答 Agent：适合平台导览、基础问答、附件分析和知识库问答。
-- 深度思考 Agent：适合复杂问题，会使用工具检索和多步分析。
-- 模型切换：前端只传模型名，后端按模型所属厂商选择对应 API Key 和 Base URL。
-- 图片识别：用户上传图片时，后端自动使用视觉模型，不需要前端手动选择视觉模型。
-- 文档处理：支持 `.txt`、`.md`、`.docx` 等文档内容提取；较大文档会建立临时索引供 Agent 检索。
-- 图片生成：支持 DashScope 文生图；同一会话内可尝试基于最近生成图进行图片编辑。
-- 会话记忆：通过 `conversation_id` 保存对话上下文。
+**基于实习项目业务场景的个人复刻与工程化迭代**
 
-## Python 版本
+本项目根据实习项目中的平台导览、知识问答与资料分析业务进行复刻，围绕真实业务问题，构建了集 **Agent 工具调用、混合 RAG、会话级附件检索、多模态分析与流式响应** 于一体的 AI 助手后端。这里展示的是复刻实现与技术迭代，不代表原实习项目的线上交付版本。
 
-建议使用 **Python 3.11**。
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-API%20Layer-009688?logo=fastapi&logoColor=white)
+![LangChain](https://img.shields.io/badge/LangChain-Agent%20Runtime-1C3C3C)
+![Chroma](https://img.shields.io/badge/Chroma-Vector%20Store-FF6B6B)
+![RAG](https://img.shields.io/badge/RAG-Hybrid%20Retrieval-7C3AED)
+![Streaming](https://img.shields.io/badge/Streaming-SSE-0284C7)
 
-查看本机已安装的 Python 版本：
+[项目亮点](#项目亮点) · [系统架构](#系统架构) · [快速开始](#快速开始) · [接口与联调](#接口与联调) · [测试与工程边界](#测试与工程边界)
 
-```powershell
-py -0p
+</div>
+
+---
+
+## 为什么做这个项目
+
+平台业务中，用户需要了解产品能力、找到操作入口、理解业务资料，还会带着文档或截图继续追问。单纯接入一个聊天模型，难以处理平台专有知识、长附件、多轮上下文和异常检索。
+
+这个项目围绕四个问题展开：
+
+| 业务问题 | 实现思路 |
+| :--- | :--- |
+| 通用模型不了解平台知识 | 本地知识库 + 混合检索 + 重排与质量门控 |
+| 文档很长，直接塞 Prompt 成本高 | 小文档直接上下文，大文档建立会话级临时索引 |
+| 用户会追问，也会上传图片和含图 Word 文档 | 会话记忆 + 视觉模型结构化分析 + 图文联合上下文 |
+| Agent 可能重复检索，排错也难 | 无进展反思提示 + 请求级 Trace + 离线回归测试 |
+
+> **仓库范围**：这是可独立启动的 Python AI 后端。原业务系统的 Vue 页面、Java 服务与 Android 工程不包含在此仓库；可通过 HTTP/SSE 接入自己的界面。
+
+## 项目亮点
+
+### 01 · 不只做向量检索：混合召回与父子分块
+
+**向量 MMR + BM25（子块召回、父块扩展） → RRF 融合 → Rerank → 质量门控与知识治理**
+
+- **双路召回**：向量通路处理语义相似，BM25 通路补充关键词、术语和精确名称；单路异常时仍可使用另一通路。
+- **RRF 排名融合**：按两路排名聚合，而非直接相加不同量纲的分数。
+- **Small-to-Big**：小块用于召回，命中后携带父块上下文；同一父块去重，不同文档的相同正文保留独立来源。
+- **中文友好切分**：优先章节、段落、句子和子句边界，最后用字符级切分兜底。
+- **关键词缓存**：分页构建只读快照，按索引 revision、业务日期、记录数量及 TTL 刷新；使用倒排结构减少重复计算。
+
+实现入口：[检索流程](src/rag/search.py) · [父子分块](src/rag/documents.py) · [BM25](src/rag/bm25.py) · [关键词缓存](src/rag/keyword_cache.py)
+
+### 02 · 让知识“有版本、有状态”：治理与增量同步
+
+- 每份文档有独立 ID 与内容指纹；正文、治理元数据或切分配置变化时，仅同步受影响文档，未变化文档跳过 Embedding。
+- 知识元数据支持负责人、权威等级、版本、状态、生效区间和原文链接；先过滤无效知识，再做召回和结果选择。
+- 同步清单记录 `pending`，JSON 采用临时文件 + 原子替换；中断后重新同步可核对未完成文档。
+- 新版完整写入后再清理旧版；文档快照和提交前指纹复核防止读到编辑中的半份内容。
+- 检索与同步共用文件锁，使向量/BM25 两路读取同一版本；损坏配置或不匹配清单显式报错，而不是静默误删。
+
+实现入口：[知识治理](src/rag/governance.py) · [增量同步](src/rag/embeddings.py) · [锁与原子写入](src/rag/sync_state.py)
+
+### 03 · 检索结果有门槛，故障路径有区别
+
+正常精排结果必须通过相关性阈值。低分、空结果或损坏响应被拦截，避免把明显不相关片段重新塞给模型；分数、索引、重复条目都有校验。
+
+对于网络或服务可用性故障，实施超时与有界退避重试。精排服务不可用时，保留经过治理的 RRF 降级结果，并在 Trace 标记降级状态；**这条路径未通过精排阈值**，不与正常通过门控混淆。
+
+实现入口：[质量门控](src/rag/search.py) · [策略说明](docs/rerank-quality-gate.md)
+
+### 04 · 普通 / 深度模式，共享工具但区别执行策略
+
+两种模式都通过 LangChain `create_agent` 使用同一组工具：
+
+| 工具 | 解决的问题 |
+| :--- | :--- |
+| `rag_search` | 平台知识库问答，返回片段与来源 |
+| `search_attachments` | 当前会话大文档的语义检索 |
+| `read_attachment_chunks` | 按顺序读取文档，辅助全文概括 |
+| `find_attachment_text` | 关键词、数字等文本精确定位 |
+
+深度模式包装工具调用，记录输入与结果指纹。连续出现空结果、重复参数或重复输出时，追加反思提示，引导改参数、换工具、拆子问题或停止无效搜索；同时设置图执行递归上限。
+
+> 普通 / 深度是两种执行模式，不是多个 Agent 并行协作。反思是基于规则触发的策略提示，不是独立评审模型或完整规划器。
+
+实现入口：[普通 Agent](src/agent/normal/react_agent.py) · [深度 Agent](src/agent/deep/react_agent.py) · [反思机制](src/agent/deep/reflection.py)
+
+### 05 · 附件不是一次性上下文：图文处理与跨轮追问
+
+- 支持 `.txt`、`.md`、`.docx` 文档，以及 `.doc` 的兼容提取；旧版 Word 的效果受编码和文件结构影响。
+- 小文档直接参与上下文；超过阈值的大文档建立会话 Chroma 索引，按需检索、顺序读取或文本定位。
+- 提取 Word 嵌入图片，视觉分析结果按文档大小进入上下文或会话索引；图片数量等统计信息单独保留。
+- 图片先分类，再使用对应 Prompt 输出结构化 JSON；通过解析回退与内容哈希缓存复用分析结果。
+- 用 `conversation_id` 保持多轮问答；近期完整对话 + 滚动摘要共同构成记忆上下文。
+- 支持文生图、基于最近生成图的编辑，以及本地 / OSS 存储切换。
+
+实现入口：[附件与会话](src/attachments/session.py) · [视觉分析](src/media/analyze.py) · [会话记忆](src/memory/service.py) · [图片生成](src/media/generate.py)
+
+### 06 · 流式响应与“可排查”的请求链路
+
+SSE 不只输出回答 Token，也输出模式状态、工具步骤、来源与会话元数据。请求级 Trace 覆盖预处理、图片分析、记忆加载、检索候选、门控决策和 Agent 输出。
+
+- `ContextVar` 隔离请求上下文，流式异常、取消和生成器关闭都有收尾处理。
+- Trace 限制数量、TTL、步骤和载荷；记录来源定位信息而非知识块全文。
+- 查询接口需运维 Bearer Token，默认关闭，响应禁止缓存。
+- 诊断记录尽力保留，日志或序列化故障不应阻断主聊天链路。
+
+实现入口：[SSE](src/agent/streaming.py) · [Trace](src/trace.py) · [访问控制与边界](docs/trace-hardening.md)
+
+## 系统架构
+
+```mermaid
+flowchart TB
+    Client[调用方 / 自建前端] --> API[FastAPI · HTTP / SSE]
+    API --> Prep[输入校验与附件预处理]
+    Prep --> Memory[近期对话 + 滚动摘要]
+    Prep --> Vision[图片 / Word 嵌图 → 结构化分析]
+    Prep --> Session[小文档上下文 / 大文档会话索引]
+    Memory --> Agent[普通或深度 Agent]
+    Vision --> Agent
+    Session --> Agent
+    Agent --> Tools[共享工具层]
+    Tools --> Attach[附件检索 / 顺序读取 / 文本定位]
+    Tools --> RAG[知识库混合检索]
+    KB[知识源文件 + 治理配置] --> Sync[指纹识别 · 增量同步 · 文件锁]
+    Sync --> Chroma[(持久化 Chroma)]
+    Chroma --> RAG
+    RAG --> Recall[MMR + BM25 → RRF → 父块去重]
+    Recall --> Rank[Rerank · 门控 · 治理排序]
+    Rank --> Agent
+    Attach --> Agent
+    Agent --> Stream[SSE 回答 + 工具步骤 + 来源]
+    Stream --> Client
+    API -.-> Trace[请求级有界 Trace]
+    Agent -.-> Trace
+    RAG -.-> Trace
+    API --> Image[文生图 / 最近图片编辑]
+    Image --> Storage[本地文件 / 可选 OSS]
 ```
 
-查看当前默认 Python 版本：
+## 快速开始
 
-```powershell
-python --version
+推荐 Python **3.11**，依赖版本见 [requirements.txt](requirements.txt)。聊天、Embedding、Rerank 和视觉能力需要自己的模型服务凭据；文本模型可用名称以服务商实际开通能力为准。
+
+### 1. 获取项目
+
+```bash
+git clone https://github.com/anchen485-collab/ai-assistant.git
+cd ai-assistant
 ```
 
-如果本机同时安装了多个 Python 版本，创建虚拟环境时优先使用：
+### 2. 创建环境并安装依赖
+
+<details>
+<summary><strong>Windows / PowerShell</strong></summary>
 
 ```powershell
 py -3.11 -m venv .venv
-```
-
-这样可以明确让 `agent/.venv` 使用 Python 3.11，避免误用其它版本导致依赖安装或运行异常。
-
-## 创建虚拟环境
-
-进入 agent 目录：
-
-```powershell
-cd D:\fronted\-\agent
-```
-
-创建虚拟环境：
-
-```powershell
-py -3.11 -m venv .venv
-```
-
-激活虚拟环境：
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-确认虚拟环境 Python 版本：
-
-```powershell
-python --version
-```
-
-正常应显示：
-
-```text
-Python 3.11.x
-```
-
-如果 PowerShell 不允许激活脚本，也可以直接使用虚拟环境里的 Python：
-
-```powershell
-.\.venv\Scripts\python.exe --version
-```
-
-## 安装依赖
-
-在 `agent/` 目录下执行：
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-如果没有激活虚拟环境，使用：
-
-```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-当前主要依赖：
-
-- `fastapi`：HTTP API 服务。
-- `uvicorn`：FastAPI 运行服务。
-- `python-dotenv`：读取 `.env` 配置。
-- `python-multipart`：支持文件上传。
-- `langchain` / `langchain-core` / `langchain-community` / `langchain-openai`：Agent、工具和模型调用。
-- `langchain-chroma` / `chromadb`：向量库。
-- `docx2txt`：提取 docx 文本。
-- `dashscope`：DashScope 图片生成等能力。
-- `Pillow`：图片压缩和格式处理。
-- `oss2`：阿里云 OSS 文件上传、下载和删除。
-
-依赖版本以 `requirements.txt` 为准。
-
-## 配置文件
-
-复制配置模板：
-
-```powershell
 Copy-Item .env.example .env
 ```
 
-`.env` 只保存在本地，不要提交真实 Key。
+</details>
 
-常用配置：
+<details>
+<summary><strong>Linux / WSL</strong></summary>
 
-```env
-# 千问模型共用配置：qwen-plus、qwen-vl-plus 等。
-DASHSCOPE_API_KEY=
-DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-
-# DeepSeek 或其它 OpenAI 兼容模型共用配置。
-OPENAI_COMPATIBLE_API_KEY=
-OPENAI_COMPATIBLE_BASE_URL=https://api.deepseek.com
-
-# 知识库配置。
-KB_SOURCE_DIR=src/rag/data
-CHROMA_DIR=data/chroma
-CHROMA_COLLECTION=qf_knowledge_base
-
-# 默认模型配置。
-# MODEL_OPTIONS 只控制前端可手动选择的文本模型列表。
-# VISION_MODEL 在用户上传图片时由后端自动使用，不需要放进 MODEL_OPTIONS。
-LLM_MODEL=qwen-plus
-MODEL_OPTIONS=qwen-plus,deepseek-chat,deepseek-reasoner
-DEFAULT_MODEL=qwen-plus
-TEXT_MODEL=qwen-plus
-VISION_MODEL=qwen-vl-plus
-
-# 上传附件配置。
-UPLOAD_DIR=data/uploads
-UPLOAD_MAX_MB=5
-UPLOAD_IMAGE_MAX_COUNT=3
-UPLOAD_TOTAL_MAX_MB=12
-VISION_IMAGE_MAX_SIDE=1280
-VISION_IMAGE_JPEG_QUALITY=80
-VISION_PAYLOAD_MAX_MB=8
-ATTACHMENT_TEXT_MAX_CHARS=8000
-ATTACHMENT_INDEX_THRESHOLD_CHARS=4000
-
-# 深度思考 Agent 参数。
-DEEP_AGENT_MODEL=deepseek-reasoner
-DEEP_AGENT_MAX_STEPS=8
-DEEP_AGENT_TEMPERATURE=0.2
-
-# 图片生成配置。
-IMAGE_GENERATION_MODEL=wan2.7-image-pro
-IMAGE_GENERATION_API_KEY=
-IMAGE_GENERATION_BASE_URL=
-IMAGE_GENERATION_SIZE=1280*1280
-IMAGE_GENERATION_COUNT=1
-IMAGE_GENERATION_PROMPT_EXTEND=true
-IMAGE_GENERATION_WATERMARK=false
-GENERATED_IMAGE_DIR=data/generated
-GENERATED_IMAGE_HISTORY_DIR=data/generated/history
-
-# 阿里云 OSS 配置。
-# 启用后，上传附件写入 uploads，生成图片写入 image-result，图片生成历史写入 history。
-OSS_ENABLED=false
-OSS_ENDPOINT=
-OSS_BUCKET=
-OSS_ACCESS_KEY_ID=
-OSS_ACCESS_KEY_SECRET=
-OSS_UPLOADS_PREFIX=uploads
-OSS_IMAGE_RESULT_PREFIX=image-result
-OSS_HISTORY_PREFIX=history
-
-# 图片编辑配置。用于“修改上一张图”这类请求。
-IMAGE_EDIT_MODEL=wan2.6-image
-IMAGE_EDIT_BASE_URL=
-IMAGE_EDIT_PROMPT_EXTEND=true
-IMAGE_EDIT_WATERMARK=false
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-模型配置规则：
+</details>
 
-- `qwen*` 模型默认使用 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`。
-- `deepseek*` 模型默认使用 `OPENAI_COMPATIBLE_API_KEY` 和 `OPENAI_COMPATIBLE_BASE_URL`。
-- 前端切换模型时只传模型名，后端不接收也不暴露 API Key。
-- 用户上传图片时，后端自动使用 `VISION_MODEL`。
+### 3. 配置模型与知识库
 
-OSS 存储规则：
+编辑 `.env`，先填写 `DASHSCOPE_API_KEY`。如使用其他兼容接口，再填写对应的 `OPENAI_COMPATIBLE_API_KEY` 和 Base URL。文本、视觉、图片生成与编辑的模型名均可配置。
 
-- `uploads`：保存用户上传的图片和文档附件。
-- `image-result`：保存图片生成/图片编辑接口返回给前端展示的结果图。
-- `history`：保存图片生成历史，用于同一会话里继续“修改上一张图”。
-- `OSS_ENABLED=false` 时完全走本地目录，适合本地开发。
-- `OSS_ENABLED=true` 时必须填写 `OSS_ENDPOINT`、`OSS_BUCKET`、`OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`。
-- 前端仍然访问原来的 `/api/attachments/{attachment_id}` 和 `/api/generated-images/{image_id}`，后端会在本地缺失时从 OSS 拉回文件。
+| 配置 | 用途 |
+| :--- | :--- |
+| `DASHSCOPE_API_KEY` / `DASHSCOPE_BASE_URL` | 千问文本与相关模型服务；Embedding / Rerank 仍需 DashScope 凭据 |
+| `OPENAI_COMPATIBLE_API_KEY` / `OPENAI_COMPATIBLE_BASE_URL` | 其他 OpenAI 兼容文本服务 |
+| `MODEL_OPTIONS` / `DEFAULT_MODEL` | 可选文本模型与默认值 |
+| `DEEP_AGENT_MAX_STEPS` / `DEEP_AGENT_TIMEOUT` | 深度模式执行与模型调用限制 |
+| `KB_SOURCE_DIR` / `CHROMA_DIR` | 知识源目录与持久化索引目录 |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | 父块切分，按字符计数；默认 800 / 100 |
+| `RETRIEVAL_K` / `RERANK_FETCH_K` / `RERANK_THRESHOLD` | 返回数、候选数与门控阈值；默认 5 / 10 / 0.3 |
+| `ATTACHMENT_INDEX_THRESHOLD_CHARS` | 大文档会话索引阈值；默认 1000 字符 |
+| `MEMORY_SUMMARY_ROUNDS` / `MEMORY_RECENT_ROUNDS` | 摘要触发与近期保留轮数；默认各 5 |
+| `TRACE_API_TOKEN` | 运维查询令牌，至少 32 字符；不填则关闭查询 |
+| `IMAGE_GENERATION_*` / `IMAGE_EDIT_*` | 图片生成与编辑；业务空间地址按实际配置 |
+| `OSS_ENABLED` / `OSS_*` | 可选对象存储；本地开发默认关闭 |
 
-## 启动服务
+知识库从 `KB_SOURCE_DIR` 顶层读取 `.txt`、`.md`、`.docx`，并要求有效的 `knowledge_metadata.json`。原文与治理字段同时进入索引；配置方法见 [知识治理说明](docs/knowledge-governance.md)。
 
-方式一：使用虚拟环境中的 uvicorn：
+> 首次构建及文档变化会调用在线 Embedding。更换 Embedding 模型或从旧版索引升级时，建议使用新的 `CHROMA_DIR` 重建，保留旧库与清单的配套备份。当前同步按启动预热 / 检索触发，不包含后台文件监听任务。
+
+### 4. 启动服务
+
+Windows：
 
 ```powershell
-cd D:\fronted\-\agent
-.\.venv\Scripts\uvicorn.exe app:app --host 0.0.0.0 --port 8000 --reload
+.\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-方式二：使用 Python 模块方式：
+Linux / WSL（已激活环境）：
 
-```powershell
-cd D:\fronted\-\agent
-.\.venv\Scripts\python.exe -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+```bash
+python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-健康检查：
+- 健康检查：<http://127.0.0.1:8000/api/health>
+- 交互式接口文档：<http://127.0.0.1:8000/docs>
 
-```text
-http://127.0.0.1:8000/api/health
+预热失败不阻塞 API 服务启动；健康检查成功仅说明服务可响应，不代表模型或知识库已经验收通过。
+
+## 接口与联调
+
+### 主要接口
+
+| 方法 | 路径 | 功能 |
+| :--- | :--- | :--- |
+| `GET` | `/api/health` | 健康检查 |
+| `GET` / `POST` | `/api/models` / `/api/models/switch` | 文本模型列表 / 校验模型选择 |
+| `POST` | `/api/chat/stream` | 普通或深度模式 SSE 聊天 |
+| `POST` | `/api/attachments/images` | 上传图片，返回附件 ID |
+| `POST` | `/api/attachments/files` | 上传文档，返回附件 ID |
+| `GET` / `DELETE` | `/api/attachments/{attachment_id}` | 读取 / 删除附件 |
+| `DELETE` | `/api/sessions/{session_id}` | 清理会话附件索引 |
+| `POST` | `/api/images/generate` | 图片生成或基于会话历史编辑 |
+| `GET` | `/api/generated-images/{image_id}` | 读取生成图片 |
+| `GET` | `/api/traces` / `/api/traces/{trace_id}` | 受保护的诊断查询 |
+
+当前聊天入口为 `/api/chat/stream`，没有独立的 `POST /api/chat` 路由。切换模型接口用于校验和返回模型名；具体聊天模型由请求中的 `model` 或默认配置决定，不持久修改服务默认值。
+
+### 发起一次流式问答
+
+```bash
+curl -N http://127.0.0.1:8000/api/chat/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"请介绍平台的主要能力","mode":"normal","conversation_id":null,"attachment_ids":[]}'
 ```
 
-如果 `8000` 端口被占用，查看占用进程：
+需要深度分析时将 `mode` 改为 `deep`；下一轮复用响应 `metadata` 中的 `conversation_id`。指定会话 ID 时应使用合法 UUID。
 
-```powershell
-netstat -ano | findstr :8000
-```
+| SSE `type` | 含义 |
+| :--- | :--- |
+| `meta` | 本轮 `trace_id` |
+| `status` | 模式与模型等状态 |
+| `delta` | 回答增量文本 |
+| `step` | 工具调用步骤 |
+| `metadata` | 来源、步骤、会话 ID、附件等 |
+| `error` / `done` | 错误提示 / 流结束 |
 
-如果改用其它端口，需要同步修改前端根目录 `vite.config.js` 中 `/agent-api` 的 `target`。
+带附件提问时，先以 multipart 字段 `file` 调用上传接口，再将返回 ID 放入 `attachment_ids`。默认单文件上限 5 MB；图片上传支持 JPEG、PNG、WebP。PDF 不在当前解析范围。
 
-## 前端联调
+### 接入前端与反向代理
 
-前端页面不会直接请求 `http://127.0.0.1:8000/api`，而是请求：
-
-```text
-/agent-api
-```
-
-根目录 `vite.config.js` 会把它代理到：
-
-```text
-http://127.0.0.1:8000/api
-```
-
-注意：
-
-- AI 小助手接口走 `/agent-api`。
-- Java 业务后端接口继续走 `/api`。
-- 不要把根目录 `/api` 代理全部改成本地 FastAPI，否则其它业务页面会请求不到 Java 后端。
-
-## 主要接口
-
-### 健康检查
-
-```http
-GET /api/health
-```
-
-### 聊天
-
-```http
-POST /api/chat
-POST /api/chat/stream
-```
-
-请求体示例：
-
-```json
-{
-  "question": "全发平台是什么？",
-  "mode": "normal",
-  "model": "qwen-plus",
-  "conversation_id": null,
-  "attachment_ids": []
-}
-```
-
-字段说明：
-
-- `question`：用户问题。
-- `mode`：`normal` 普通模式，`deep` 深度思考模式。
-- `model`：文本模型名，可为空；为空时使用默认模型。
-- `conversation_id`：会话 ID，用于记忆和图片生成历史。
-- `attachment_ids`：本轮请求携带的附件 ID。
-
-### 模型列表与切换
-
-```http
-GET /api/models
-POST /api/models/switch
-```
-
-切换模型接口只记录模型名；实际回答时也可以在 `/api/chat` 或 `/api/chat/stream` 请求体中传 `model`，本轮优先使用该模型。
-
-### 附件上传
-
-```http
-POST /api/attachments/images
-POST /api/attachments/files
-GET  /api/attachments/{attachment_id}
-```
-
-说明：
-
-- `/api/attachments/images` 只允许上传图片。
-- `/api/attachments/files` 只允许上传文档。
-- 图片会走视觉模型识别。
-- 文档会提取文本；超过 `ATTACHMENT_INDEX_THRESHOLD_CHARS` 的文档会建立会话级临时索引。
-
-### 图片生成
-
-```http
-POST /api/images/generate
-GET  /api/generated-images/{image_id}
-```
-
-说明：
-
-- 文生图使用 DashScope 图片生成模型。
-- 如果用户在同一 `conversation_id` 下提出“修改上一张图”这类请求，后端会尝试使用最近一次生成图作为参考图。
-- 生成结果会下载到 `data/generated`，再返回给前端渲染。
-
-### 调试追踪
-
-```http
-GET /api/traces
-GET /api/traces/{trace_id}
-```
-
-用于查看一次请求中的预处理、附件识别、模型调用、工具调用等链路信息。
+服务本身使用 `/api/*`。原业务前端使用 `/agent-api` 代理前缀，联调时将该前缀转发到 FastAPI，并重写为 `/api`；保留 Java 业务的 `/api` 路由，不与 AI 服务混用。SSE 代理需要关闭响应缓冲，并配置合适的连接超时。当前 CORS 允许本机 5173 端口。
 
 ## 项目结构
 
 ```text
-agent/
-├─ app.py                       FastAPI 入口
-├─ requirements.txt             Python 依赖
-├─ .env.example                 环境变量示例
-├─ data/                        运行时数据，通常不提交
-└─ src/
-   ├─ agent/
-   │  ├─ normal/                普通 Agent
-   │  ├─ deep/                  深度思考 Agent
-   │  └─ streaming.py           流式输出
-   ├─ attachments/              附件上传、加载、文档解析、会话索引
-   ├─ core/
-   │  └─ config.py              配置读取和模型配置解析
-   ├─ media/                    图片分析、图片上传、图片生成、图片编辑
-   ├─ memory/                   conversation_id 会话记忆
-   ├─ rag/                      知识库加载、切分、向量检索
-   ├─ tools/                    Agent 工具
-   └─ trace.py                  调试追踪
+ai-assistant/
+├── app.py                       # API、SSE、附件预处理与 Trace 权限
+├── requirements.txt             # 运行依赖
+├── .env.example                 # 配置模板，不含真实凭据
+├── src/
+│   ├── agent/                   # 普通 / 深度模式、反思、流式适配
+│   ├── attachments/             # 上传、Word 解析、会话索引与读取工具
+│   ├── core/config.py           # 模型路由与集中配置
+│   ├── media/                   # 图片分类、分析、缓存、生成与编辑
+│   ├── memory/                  # JSON 会话存储与滚动摘要
+│   ├── rag/                     # 父子分块、混合检索、同步、治理与缓存
+│   │   └── data/                # 知识源与治理元数据
+│   ├── storage/oss.py           # 可选 OSS 存储适配
+│   ├── tools/rag.py             # Agent 工具集入口
+│   └── trace.py                 # 有界内存诊断缓存
+├── tests/                       # 当前离线单元 / 组件 / Chroma 回归测试
+└── docs/                        # 各模块设计、故障恢复与部署边界
 ```
 
-## 常见问题
+## 测试与工程边界
 
-### 1. 修改 `.env` 后没有生效
+### 172 项离线回归测试
 
-`.env` 在服务启动时读取。修改后需要停止并重新启动 FastAPI。
+2026-10-12，在已有 Python 3.11 项目环境中执行 `unittest`：**172 项测试通过**。覆盖 BM25 公式与边界、父块去重、单路故障、知识生效期、损坏配置、增量恢复、读写锁、真实临时 Chroma、精排响应校验，以及 Trace 访问控制和 SSE 取消路径。
 
-如果 PyCharm Run/Debug Configuration 配置了同名环境变量，它可能会覆盖 `.env`。
-
-### 2. 前端请求 AI 小助手失败
-
-确认 FastAPI 已启动：
-
-```text
-http://127.0.0.1:8000/api/health
+```bash
+python -m pip install httpx
+python -m unittest discover -s tests -v
 ```
 
-再确认前端 `vite.config.js` 中 `/agent-api` 的 `target` 端口和 FastAPI 实际端口一致。
+Windows 可使用 `.\.venv\Scripts\python.exe` 替换上述 `python`。测试以本地测试向量或网络桩隔离在线服务，不消耗真实模型调用额度。
 
-### 3. 上传后出现 `agent/storage` 目录
+**这些结果证明已覆盖相应代码路径，不等同于真实模型准确率、完整前后端验收或生产压测。** 当前没有声明检索准确率、延迟优化百分比或线上吞吐指标；全新环境依赖安装也需独立验证。历史 `Test/` 目录保留旧接口实验，当前回归入口使用 `tests/`。
 
-当前默认上传目录是：
+### 当前工程取舍
 
-```env
-UPLOAD_DIR=data/uploads
-```
+| 已实现 | 当前边界 |
+| :--- | :--- |
+| 文档级增量同步、互斥锁与中断恢复 | 面向单机持久化目录；建议单应用进程，不承诺多实例缓存一致性 |
+| 规则反思与执行递归限制 | 不是完整的目标进度状态机，也没有通用自动规划器 |
+| 来源返回与质量门控 | 来源集合不等于每句话的引用核验；精排降级需单独识别 |
+| 会话 JSON 存储、摘要与附件索引 | 不具备完整的租户鉴权；UUID 是会话标识，不是权限凭据 |
+| 受保护的 Trace 查询 | 内存缓存重启清空，非集中式持久化审计系统 |
+| 附件生命周期清理 | 服务关闭会清理会话附件索引和本地上传目录，应提前设计保留策略 |
 
-如果请求后仍出现 `agent/storage`，一般说明运行中的后端进程读到了旧的 `UPLOAD_DIR=storage` 配置。检查 PyCharm 环境变量、系统环境变量，然后重启服务。
+公开部署前，请补齐业务接口鉴权、会话/附件资源权限、网关限流、HTTPS 和真实模型联调；对业务资料与自由文本进行必要的脱敏。真实 Key、用户上传、生成结果、会话记录和运行索引留在本地或受控存储，不进入提交。
 
-### 4. 知识库目录不存在
+### 进一步阅读
 
-检查：
+- [混合检索与缓存设计](docs/hybrid-retrieval-hardening.md)
+- [知识治理策略](docs/knowledge-governance.md)
+- [增量同步、故障恢复与部署建议](docs/rag_sync_hardening.md)
+- [重排与质量门控](docs/rerank-quality-gate.md)
+- [Trace 稳定性与访问控制](docs/trace-hardening.md)
 
-```env
-KB_SOURCE_DIR=src/rag/data
-```
+---
 
-如果目录不存在，部分 RAG 流程可能无法检索。可以先创建该目录，或者把 `KB_SOURCE_DIR` 改为真实知识库目录。
+<div align="center">
 
-### 5. 终端中文乱码
+**从实习业务场景出发，把“能回答”迭代为“有依据、可追踪、可维护”。**
 
-Windows PowerShell 可以先执行：
-
-```powershell
-chcp 65001
-```
-
-然后重新启动服务。
-
-## 提交提醒
-
-当前 agent 开发分支是：
-
-```text
-feature/ai-agent
-```
-
-不要直接推送到 `master`。提交 agent 文档时可以执行：
-
-```powershell
-git add agent/README.md
-git commit -m "docs: update agent readme"
-git push origin feature/ai-agent
-```
+</div>

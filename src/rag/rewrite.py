@@ -59,7 +59,7 @@ def rewrite_query(
                  格式为 [{"role": "user/assistant", "content": "..."}, ...]。
         api_key: LLM API Key，默认从环境变量读取。
         base_url: LLM API 地址，默认使用 OPENAI_COMPATIBLE_BASE_URL。
-        model: 模型名，默认用 deepseek-chat（轻量快速适合重写任务）。
+        model: 模型名，默认用 deepseek-v4-flash（轻量快速适合重写任务）。
 
     Returns:
         RewriteResult，包含原始问题、重写后问题和改动列表。
@@ -119,7 +119,7 @@ def _call_llm_rewrite(
     ).rstrip("/")
     if not base_url.endswith("/v1"):
         base_url = f"{base_url}/v1"
-    model = model or os.getenv("REWRITE_MODEL") or "deepseek-chat"
+    model = model or os.getenv("REWRITE_MODEL") or "deepseek-v4-flash"
 
     messages = _build_rewrite_messages(query, history)
 

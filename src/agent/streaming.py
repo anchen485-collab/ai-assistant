@@ -18,7 +18,7 @@ from src.agent.normal.react_agent import (
 from src.agent.normal.service import recommendations
 from src.core.config import ModelConfig, settings
 from src.memory.service import build_context, save_turn
-from src.trace import log_step_ctx
+from src.trace import log_step_ctx, source_refs
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +279,7 @@ async def _stream_agent_answer(
                          agent=mode, model=model_name,
                          steps=len(event.get("steps", [])),
                          sources=len(event.get("sources", [])),
+                         source_refs=source_refs(event.get("sources", [])),
                          answer_len=len(final_answer))
             if final_answer:
                 try:

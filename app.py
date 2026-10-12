@@ -5,14 +5,17 @@ from __future__ import annotations
 当前前端已经接入独立页面，因此这里只保留前端需要调用的 HTTP API。
 """
 
+import asyncio
 import logging
+import os
+import secrets
 import re
 import shutil
 import time
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -32,7 +35,7 @@ from src.attachments import (
     save_upload,
     set_current_session,
 )
-from src.core.config import ModelConfig, settings
+from src.core.config import ModelConfig, canonical_model_name, settings
 from src.attachments.document import extract_doc_images, extract_docx_images, extract_text
 from src.media.analyze import analyze_with_cache
 from src.media.context import has_image_attachments, json_to_context
@@ -40,7 +43,7 @@ from src.media.generate import ensure_generated_image_local, generate_image
 from src.media.upload import is_image
 from src.memory.service import normalize_conversation_id
 from src.rag.search import search
-from src.trace import finish_trace, get_trace, list_traces, log_step, new_trace
+from src.trace import clear_trace, finish_trace, get_trace, list_traces, log_step, new_trace, set_trace
 
 
 logging.basicConfig(
@@ -119,47 +122,64 @@ async def chat_stream(payload: ChatRequest) -> StreamingResponse:
     """流式聊天接口，由 Agent 的 token 事件实时推送给前端。"""
 
     trace_id = new_trace()
-    t_start = time.perf_counter()
-    mode = validate_mode(payload.mode)
-    conversation_id = normalize_conversation_id(payload.conversation_id) or str(uuid4())
+    try:
+        t_start = time.perf_counter()
+        mode = validate_mode(payload.mode)
+        conversation_id = normalize_conversation_id(payload.conversation_id) or str(uuid4())
 
-    attachments = load_attachments(payload.attachment_ids)
-    model_config = resolve_model_for_chat(payload.model)
+        attachments = load_attachments(payload.attachment_ids)
+        model_config = resolve_model_for_chat(payload.model)
 
-    # Vision Step：图片 → 结构化 JSON → 纯文本上下文
-    image_context = _analyze_images(attachments, trace_id)
-    full_context = _process_document_context(attachments, trace_id, image_context, conversation_id)
+        # Vision Step：图片 → 结构化 JSON → 纯文本上下文
+        image_context = _analyze_images(attachments, trace_id)
+        full_context = _process_document_context(attachments, trace_id, image_context, conversation_id)
 
-    log_step(trace_id, "preprocess", ok=True, duration_ms=(time.perf_counter() - t_start) * 1000,
-             mode=mode, model=model_config.name, attachments=len(attachments),
-             has_images=has_image_attachments(attachments))
-    logger.info(
-        "收到流式聊天请求：trace_id=%s mode=%s model=%s attachments=%s question=%s",
-        trace_id, mode, model_config.name, len(attachments), payload.question,
-    )
+        log_step(trace_id, "preprocess", ok=True, duration_ms=(time.perf_counter() - t_start) * 1000,
+                 question=payload.question, mode=mode, model=model_config.name,
+                 attachments=len(attachments), has_images=has_image_attachments(attachments))
+        logger.info(
+            "收到流式聊天请求：trace_id=%s mode=%s model=%s attachments=%s",
+            trace_id, mode, model_config.name, len(attachments),
+        )
 
-    return StreamingResponse(
-        stream_chat_events(
-            trace_id=trace_id,
-            question=payload.question,
-            mode=mode,
-            model_config=model_config,
-            conversation_id=conversation_id,
-            attachment_context=full_context,
-            image_urls=[],
-            attachment_ids=[item.id for item in attachments],
-        ),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+        return StreamingResponse(
+            stream_chat_events(
+                trace_id=trace_id,
+                question=payload.question,
+                mode=mode,
+                model_config=model_config,
+                conversation_id=conversation_id,
+                attachment_context=full_context,
+                image_urls=[],
+                attachment_ids=[item.id for item in attachments],
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except BaseException as exc:
+        # 预处理失败或任务取消时也结束 Trace，然后原样向上抛出。
+        log_step(trace_id, "preprocess:error", ok=False, error_type=type(exc).__name__)
+        finish_trace(trace_id)
+        raise
+    finally:
+        # StreamingResponse 可能在另一个任务执行，由生成器自己绑定 Trace。
+        clear_trace()
 
 
+@app.get("/models")
+@app.get("/agent-api/models")
 @app.get("/api/models")
 def list_models() -> dict:
-    """返回前端可手动选择的文本模型列表。视觉模型不在这里展示。"""
+    """返回前端可手动选择的文本模型列表。视觉模型不在这里展示。
+
+    兼容三种路径：
+    1. /api/models：FastAPI 原始接口。
+    2. /agent-api/models：前端代理前缀，适合没有 rewrite 的部署环境。
+    3. /models：本地直接调试时的短路径。
+    """
 
     return {
         "default": settings.default_model,
@@ -237,6 +257,8 @@ def delete_session(session_id: str) -> dict:
     return {"ok": True}
 
 
+@app.post("/models/switch")
+@app.post("/agent-api/models/switch")
 @app.post("/api/models/switch")
 def switch_model(payload: ModelSwitchRequest) -> dict:
     """切换当前文本模型。"""
@@ -270,15 +292,30 @@ def get_generated_image(image_id: str) -> FileResponse:
 # ── Trace 查询接口 ────────────────────────────────────────────────
 
 
-@app.get("/api/traces")
-def api_list_traces(limit: int = 50) -> dict:
+def require_trace_access(authorization: str | None = Header(default=None)) -> None:
+    """Trace 包含用户问题，仅供持有运维令牌的人排障；未配置时关闭查询。"""
+    token = os.getenv("TRACE_API_TOKEN", "").strip()
+    if not token:
+        raise HTTPException(status_code=404, detail="Trace 查询未启用。")
+    if len(token) < 32:
+        raise HTTPException(status_code=503, detail="Trace 查询令牌配置不符合要求。")
+    scheme, _, supplied = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(supplied.encode(), token.encode()):
+        raise HTTPException(status_code=401, detail="Trace 查询需要有效凭据。",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+
+@app.get("/api/traces", dependencies=[Depends(require_trace_access)])
+def api_list_traces(response: Response, limit: int = Query(default=50, ge=1, le=100)) -> dict:
     """列出最近的 trace 记录。"""
+    response.headers["Cache-Control"] = "no-store"
     return {"traces": list_traces(limit)}
 
 
-@app.get("/api/traces/{trace_id}")
-def api_get_trace(trace_id: str) -> dict:
+@app.get("/api/traces/{trace_id}", dependencies=[Depends(require_trace_access)])
+def api_get_trace(trace_id: str, response: Response) -> dict:
     """按 trace_id 查询完整分析链路。"""
+    response.headers["Cache-Control"] = "no-store"
     record = get_trace(trace_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="trace 不存在。")
@@ -300,6 +337,7 @@ async def stream_chat_events(
 ):
     """把普通 Agent 或深度思考 Agent 的流式结果转发给前端。"""
 
+    set_trace(trace_id)
     try:
         stream_kwargs = {
             "model_config": model_config,
@@ -317,13 +355,16 @@ async def stream_chat_events(
             async for sse_str in stream_normal_answer(question, **stream_kwargs):
                 yield sse_str
 
-        finish_trace(trace_id)
+    except (asyncio.CancelledError, GeneratorExit):
+        log_step(trace_id, "stream:cancelled", ok=False)
+        raise
     except Exception as exc:
         logger.exception("流式聊天请求失败：trace_id=%s", trace_id)
         log_step(trace_id, "error", ok=False, error=str(exc))
+        yield _sse({"type": "error", "text": f"请求失败：{exc}"})
+        yield _sse({"type": "done"})
+    finally:
         finish_trace(trace_id)
-        yield f"data: {{\"type\": \"error\", \"text\": \"请求失败：{exc}\"}}\n\n"
-        yield "data: {\"type\": \"done\"}\n\n"
 
 
 def _process_document_context(
@@ -643,7 +684,7 @@ def validate_mode(mode: str) -> str:
 def resolve_model(model: str | None) -> ModelConfig:
     """校验前端手动选择的文本模型。"""
 
-    selected = (model or settings.default_model).strip()
+    selected = canonical_model_name(model or settings.default_model)
     if selected not in settings.model_options:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -655,7 +696,7 @@ def resolve_model(model: str | None) -> ModelConfig:
 def resolve_model_for_chat(model: str | None) -> ModelConfig:
     """解析聊天使用的文本模型。图片已通过 Vision Step 预处理为文本，不再需要视觉模型切换。"""
 
-    selected = (model or settings.text_model or settings.default_model).strip()
+    selected = canonical_model_name(model or settings.text_model or settings.default_model)
 
     # 如果选中了视觉模型（如 qwen-vl-max），回退到默认文本模型
     if selected == settings.vision_model:

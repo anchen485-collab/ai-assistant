@@ -44,10 +44,35 @@ def env_list(name: str, defaults: list[str]) -> list[str]:
     return merged
 
 
+MODEL_ALIASES = {
+    # DeepSeek 2026-07-24 起模型名变更，保留旧名兼容浏览器缓存和历史 .env。
+    "deepseek-chat": "deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek-v4-pro",
+}
+
+
+def canonical_model_name(model: str | None) -> str:
+    """把历史模型名映射成当前模型服务可识别的模型名。"""
+
+    selected = (model or "").strip()
+    return MODEL_ALIASES.get(selected, selected)
+
+
+def canonical_model_list(models: list[str]) -> list[str]:
+    """规范化模型列表并去重，避免旧模型名继续暴露给前端。"""
+
+    normalized: list[str] = []
+    for model in models:
+        selected = canonical_model_name(model)
+        if selected and selected not in normalized:
+            normalized.append(selected)
+    return normalized
+
+
 def env_choice(name: str, options: list[str], default: str) -> str:
     """读取一个必须在候选列表中的配置项。"""
 
-    value = os.getenv(name, default).strip()
+    value = canonical_model_name(os.getenv(name, default))
     return value if value in options else options[0]
 
 
@@ -78,9 +103,9 @@ class Settings:
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "100"))
 
     # 深度思考 Agent 使用 OpenAI 兼容接口。
-    # DeepSeek-R1 可配置为：
+    # DeepSeek V4 thinking 模式可配置为：
     # OPENAI_COMPATIBLE_BASE_URL=https://api.deepseek.com
-    # DEEP_AGENT_MODEL=deepseek-reasoner
+    # DEEP_AGENT_MODEL=deepseek-v4-pro
     openai_compatible_api_key: str = first_env(
         "OPENAI_COMPATIBLE_API_KEY",
         "DEEP_AGENT_API_KEY",
@@ -90,18 +115,22 @@ class Settings:
     openai_compatible_base_url: str = os.getenv(
         "OPENAI_COMPATIBLE_BASE_URL", "https://api.deepseek.com"
     )
-    deep_agent_model: str = os.getenv("DEEP_AGENT_MODEL", "deepseek-reasoner")
+    deep_agent_model: str = canonical_model_name(
+        os.getenv("DEEP_AGENT_MODEL", "deepseek-v4-pro")
+    )
     deep_agent_temperature: float = float(os.getenv("DEEP_AGENT_TEMPERATURE", "0.2"))
     deep_agent_max_steps: int = int(os.getenv("DEEP_AGENT_MAX_STEPS", "12"))
     deep_agent_timeout: int = int(os.getenv("DEEP_AGENT_TIMEOUT", "90"))
 
     # 模型选择只维护一份列表；normal/deep 只决定走哪个 Agent。
-    model_options: list[str] = env_list(
-        "MODEL_OPTIONS",
-        [llm_model, deep_agent_model, "deepseek-chat"],
+    model_options: list[str] = canonical_model_list(
+        env_list(
+            "MODEL_OPTIONS",
+            [llm_model, "deepseek-v4-flash", deep_agent_model],
+        )
     )
     default_model: str = env_choice("DEFAULT_MODEL", model_options, model_options[0])
-    text_model: str = os.getenv("TEXT_MODEL", default_model)
+    text_model: str = canonical_model_name(os.getenv("TEXT_MODEL", default_model))
 
     # 用户上传的图片和文件先落到本地，再由聊天接口按附件类型处理。
     upload_dir: Path = env_path("UPLOAD_DIR", ROOT_DIR / "data" / "uploads")
@@ -306,6 +335,7 @@ class Settings:
     def model_config(self, model: str) -> ModelConfig:
         """按模型名选择厂商级 key/base_url，再把模型名原样传给模型服务。"""
 
+        model = canonical_model_name(model)
         api_key = self.provider_api_key(model)
         base_url = self.provider_base_url(model)
         return ModelConfig(name=model, api_key=api_key, base_url=base_url)

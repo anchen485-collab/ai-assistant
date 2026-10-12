@@ -35,8 +35,8 @@ def build_splitter(
     的片段才会用下一级继续切，因此一个自然段落只要不超过上限就是完整 chunk。
     """
     return RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size or settings.chunk_size,
-        chunk_overlap=chunk_overlap or settings.chunk_overlap,
+        chunk_size=settings.chunk_size if chunk_size is None else chunk_size,
+        chunk_overlap=settings.chunk_overlap if chunk_overlap is None else chunk_overlap,
         is_separator_regex=True,
         separators=[
             # Level 1: 章节/标题边界
@@ -55,6 +55,7 @@ def build_splitter(
             r"(?<=；)",
             r"(?<=，)",
             # Level 5: 兜底 — 按字符硬切
+            "",
         ],
     )
 

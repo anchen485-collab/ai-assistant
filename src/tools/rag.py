@@ -11,7 +11,7 @@ from langchain_core.tools import tool
 
 from src.rag.rewrite import has_pronoun, rewrite_query
 from src.rag.search import SearchHit, search, serialize_hits
-from src.trace import log_step_ctx
+from src.trace import log_step_ctx, source_refs
 
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,9 @@ def run_rag_search(query: str, k: int = 5) -> ToolResult:
 
     logger.info("RAG 检索完成：query=%s, hits=%s", rewritten_query, len(hits))
     log_step_ctx("rag:search", ok=True, duration_ms=(time.perf_counter() - t0) * 1000,
-                 query=rewritten_query, original_query=query, hits=len(hits))
+                 query=rewritten_query, original_query=query,
+                 query_rewritten=rewritten_query != query, hits=len(hits),
+                 selected_sources=source_refs(hits))
     if not hits:
         return ToolResult(f"没有检索到与「{rewritten_query}」相关的知识库片段。", [])
 

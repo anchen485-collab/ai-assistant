@@ -1,0 +1,31 @@
+{
+  "default": {
+    "owner": "全发平台运营",
+    "authority_rank": 100,
+    "version": "1.0",
+    "status": "active",
+    "published_at": "",
+    "effective_from": "",
+    "effective_to": "",
+    "region": "global",
+    "product": "全发平台",
+    "source_url": ""
+  },
+  "documents": {
+    "全球发展线上平台操作指引知识库.docx": {
+      "knowledge_id": "platform-operation-guide"
+    },
+    "全球发展线上平台场景案例知识库（电力行业-光伏赛道）.docx": {
+      "knowledge_id": "solar-case-study"
+    },
+    "全球发展线上平台场景案例知识库（电力行业.docx": {
+      "knowledge_id": "power-industry-case-study"
+    },
+    "全球共同发展线上平台介绍知识库.docx": {
+      "knowledge_id": "platform-overview"
+    },
+    "全球共同发展线上平台频道介绍知识库.docx": {
+      "knowledge_id": "platform-channel-overview"
+    }
+  }
+}
